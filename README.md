@@ -2,7 +2,7 @@
 Below is a few different techniques to get files to EFS
 
 ## Using CodePipeline/CodeBuild
-[CodeBuild.yaml](./codepipeline/codepipeline.yaml) 
+[CodePipeline.yaml](./code-pipeline/codepipeline.yaml) 
 
 ## Using Lambda function
 [Lambda](./lambda/lambda.yaml)
