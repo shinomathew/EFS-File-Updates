@@ -1,0 +1,444 @@
+# Warning: This is a very basic cloudformation script
+#          No validation for any parameter values
+#          Not tested extensively, only have done minimum testing
+#          IAM policies created by the templates are more permissive than required
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cloudformation for deploying a codepipeline that can sync files from a S3 bucket to EFS
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network configuration
+        Parameters:
+          - AwsVpc
+          - Subnets
+          - SecurityGroupId
+      - Label:
+          default: DAG update pipeline
+        Parameters:
+          - FileSourceZip
+          - TargetEFSID
+
+    ParameterLabels:
+      AwsVpc:
+        default: VPC where EFS is located
+      Subnets:
+        default: Subnets in the VPC where the EFS has access points
+
+      SecurityGroupId:
+        default: Existing security group id to be used
+      FileSourceZip:
+        default: Zip file containing extfiles
+      TargetEFSID:
+        default: ID of the EFS to which file copy needs to happen
+
+
+Parameters:
+  AwsVpc:
+    Description: Name of existing AWS Vpc
+    Type: AWS::EC2::VPC::Id
+    
+  Subnets:
+    Description: Subnets where the service to startup
+    Type: List<AWS::EC2::Subnet::Id>
+    
+  SecurityGroupId:
+    Description: Existing security groups to assign to the airflow cluster nodes
+    Type: String
+    
+  FileSourceBucket:
+    Description: S3 bucket that hosts the files to be copied
+    Type: String
+    
+  FileSourceZip:
+    Description: source zip in S3
+    Type: String
+    
+  TargetEFSID:
+    Description: Target EFS id
+    Type: String
+    
+
+Resources:
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-CodeBuild-Role
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codebuild.amazonaws.com]
+        Version: '2012-10-17'
+
+  CodeBuildPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows CodeBuild to perform builds and deploys
+      ManagedPolicyName: !Sub ${AWS::StackName}-CodeBuild-Policy
+      Roles:
+        - !Ref CodeBuildRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -  # Allow codebuild to write to cloudwatch
+            Sid: CloudWatchLogsPermissionsForAllCodeBuildProjects
+            Effect: Allow
+            Action:
+              - logs:*
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*:*
+          -  # Allow codebuild to list and get objects from any bucket
+            Sid: S3BucketPolicy
+            Effect: Allow
+            Action:
+              - s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${FileSourceBucket}
+              - !Sub arn:aws:s3:::${FileSourceBucket}/*
+              - !GetAtt PipelineBucket.Arn
+              - !Sub ${PipelineBucket.Arn}/*
+
+          -  # Allow codebuild to write reports
+            Sid: CodeBuildReportingPolicy
+            Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:UpdateReport
+              - codebuild:UpdateProject
+            Resource:
+              - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:*/*"
+
+          -  # Allow codebuild to list and get objects from any bucket
+            Sid: EC2Access
+            Effect: Allow
+            Action:
+              - ec2:Describe*
+              - ec2:Create*
+              - ec2:*SecurityGroup*
+              - ec2:DeleteNetworkInterface
+            Resource: '*'
+
+          -  # Allow codebuild to list and get objects from any bucket
+            Sid: EFSAccess
+            Effect: Allow
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientRootAccess
+              - elasticfilesystem:ClientWrite
+              - elasticfilesystem:ClientMount
+            Resource: '*'
+          
+          -  # Allow codebuild to perform encryption and decryption
+            Sid: KMSPolicy
+            Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GetKeyPolicy
+              - kms:List*
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:Generate*
+            Resource:
+              - !GetAtt PipelineKMSKey.Arn
+
+  # CodeBuild for to update EFS
+  CodeBuildProjectDev:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+    - CodeBuildPolicy
+    Properties:
+      Name: !Sub CodePipeline-EFS-Update-${AWS::StackName}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        Subnets: !Ref Subnets
+        VpcId: !Ref AwsVpc
+
+      FileSystemLocations:
+        - Identifier: ExternalFiles
+          Location: !Sub ${TargetEFSID}.efs.${AWS::Region}.amazonaws.com:/
+          MountPoint: /mnt/efs
+          Type: EFS
+
+
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Nothing to setup here
+            build:
+              commands:
+                - echo "Starting file copy"
+                # Add the commands to copy files here
+                # eg:
+                # - rsync -avu --delete . /mnt/efs/external_files
+
+            post_build:
+              commands:
+                - echo Build done
+
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: True
+        EnvironmentVariables:
+          -
+            Name: SOURCE_S3
+            Type: PLAINTEXT
+            Value: !Ref FileSourceBucket
+      Tags:
+        - Key: DeployStage
+          Value: Build
+        - Key: ProjectName
+          Value: !Sub CodePipeline-EFS-Update-${AWS::StackName}
+
+  PipelineKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key used by cloudformation codepipeline
+      Enabled: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-consolepolicy-3
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow attachment of persistent resources
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+              - kms:Encrypt
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: 'true'
+
+  # S3 bucket used by the pipeline
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: PipelineKMSKey
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                KMSMasterKeyID: !Ref PipelineKMSKey
+                SSEAlgorithm: aws:kms
+
+  # S3 Bucket policy for the artifact storage bucket
+  PipelineBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PipelineBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Action: 
+            - '*'
+          Effect: Allow
+          Resource:
+            - !Join [ "", [ "arn:aws:s3:::", Ref: PipelineBucket ] ]
+            - !Join [ "", [ "arn:aws:s3:::", Ref: PipelineBucket, "/*" ] ]
+          Principal:
+            AWS:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+
+  # Cloudformation Service role used by the pipeline to deploy cloudformation scripts      
+  
+
+  #IAM role assumed by the pipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    DependsOn: PipelineKMSKey
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codepipeline.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 's3:*'
+                - 'cloudformation:CreateStack'
+                - 'cloudformation:DescribeStacks'
+                - 'cloudformation:DeleteStack'
+                - 'cloudformation:UpdateStack'
+                - 'cloudformation:CreateChangeSet'
+                - 'cloudformation:ExecuteChangeSet'
+                - 'cloudformation:DeleteChangeSet'
+                - 'cloudformation:DescribeChangeSet'
+                - 'cloudformation:SetStackPolicy'
+                - 'cloudformation:ValidateTemplate'
+                - 'iam:PassRole'
+                - 'sns:Publish'
+                - 'codebuild:CreateReportGroup'
+                - 'codebuild:CreateReport'
+                - 'codebuild:UpdateReport'
+                - 'codebuild:BatchPutTestCases'
+                - 'codebuild:BatchPutCodeCoverages'
+                - 'codebuild:StartBuild'
+                - 'codebuild:BatchGetBuilds'
+                - 'codebuild:BatchGetBuildBatches'
+                - 'codebuild:StartBuildBatch'
+                - 'kms:*'
+                Effect: Allow
+                Resource: '*'
+  # IAM role to be assumed by cloudwatch event rules to trigger a code pipeline
+  CloudWatchPipelineTriggerRole:
+    DependsOn: FileUpdatePipeline
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-cicd-trigger
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-cicd-cw-trigger-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: # Allow CloudWatch to trigger any pipeline
+                  - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${FileUpdatePipeline}
+                  - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${FileUpdatePipeline}-code-check-in-trigger 
+
+  # Cloudwatch event rule, to trigger the pipeline when the code is uploaded to the Source S3 bucket
+  S3CodeCheckCloudWatchEvent:
+    DependsOn: FileUpdatePipeline
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch event rule to trigger Code pipeline on s3 upload/update
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          requestParameters:
+            bucketName: 
+              - !Ref FileSourceBucket
+            key: 
+              - !Ref FileSourceZip
+          eventName:
+            - PutObject
+            - CompleteMultipartUpload
+            - CopyObject
+      Name: !Join [ '-', [ !Ref FileUpdatePipeline, 'code-check-in-trigger' ]]
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${FileUpdatePipeline}
+          Id: !Sub ${FileUpdatePipeline}
+          RoleArn: !GetAtt CloudWatchPipelineTriggerRole.Arn
+  
+  
+  #Pipeline updates
+  FileUpdatePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn: PipelineKMSKey
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      RestartExecutionOnUpdate: true
+      Name: !Sub Pipeline-${AWS::StackName}
+      ArtifactStore:
+        Type: S3
+        Location:  !Ref PipelineBucket
+        EncryptionKey:
+          Id: !GetAtt PipelineKMSKey.Arn
+          Type: KMS
+      
+      # Pipeline has different stages, Source/build/deploy etc.          
+      Stages:
+        # Source stage, downloading the code from the given S3 bucket/prefix
+        - Name: Source-S3-Buckets
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              Configuration:
+                S3Bucket: !Ref FileSourceBucket
+                S3ObjectKey: !Ref FileSourceZip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: S3Artifacts
+              RunOrder: 1
+
+        - Name: Build-extfiles-deploy
+          Actions:
+            - Name: Deploy-extfiles-updates
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              RunOrder: 1
+              InputArtifacts:
+                - Name: S3Artifacts
+              OutputArtifacts:
+                - Name: BuildArtifactDev
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectDev
+
+
+Outputs:
+  LogicalID:
+    Description: Pipeline
+    Value: !Ref FileUpdatePipeline
