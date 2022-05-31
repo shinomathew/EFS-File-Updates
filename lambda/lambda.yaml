@@ -1,0 +1,185 @@
+# Warning: This is a very basic cloudformation script
+#          Using an AWS lambday layer published, better to build your own lambda layer and use it
+#          No validation for any parameter values
+#          Not tested extensively, only have done minimum testing
+#          IAM policies created by the templates are more permissive than required
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cloudformation for deploying a codepipeline that can sync files from a S3 bucket to EFS
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network configuration
+        Parameters:
+          - Subnets
+          - SecurityGroupId
+      - Label:
+          default: EFS settings
+        Parameters:
+          - EFSAccessPoint
+      - Label:
+          default: General config
+        Parameters:
+          - FileSourceBucketIdentifier
+          - AWSCliLambdaLayer          
+
+    ParameterLabels:
+      Subnets:
+        default: Subnets in the VPC where the EFS has access points
+      SecurityGroupIds:
+        default: Existing security group ids to be used with lambda
+      AWSCliLambdaLayer:
+        default: Arn of the aws cli lambda layer used
+      EFSAccessPoint:
+        default: EFS's access point
+      FileSourceBucketIdentifier:
+        default: String for S3 bucket name
+
+Parameters:
+  Subnets:
+    Description: Subnets where the service to startup
+    Type: List<AWS::EC2::Subnet::Id>
+  AWSCliLambdaLayer:
+    Description: Arn of Lambda layer providing AWSCli to the lambda function
+    Type: String
+    Default: arn:aws:lambda:ap-southeast-2:943200858682:layer:AWSCli:1
+  EFSAccessPoint:
+    Description: Access point of the EFS where files are copied to
+    Type: String
+    Default: arn:aws:elasticfilesystem:ap-southeast-2:391966620943:access-point/fsap-0975119ca18728bcb
+  FileSourceBucketIdentifier:
+    Description: An identifier to use with the S3 bucket used to hold source files
+    Type: String
+    Default: efssharesource
+  SecurityGroupIds:
+    Description: Security groups to attach to the lambda function
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+Resources:
+  # S3 bucket used as the source
+  FileSourceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+    - SourceUpdateFunction
+    - S3LambdaInvokePermission
+    Properties:
+      BucketName: !Sub ${FileSourceBucketIdentifier}-efs-source-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt SourceUpdateFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                - Name: suffix
+                  Value: .txt
+                - Name: prefix
+                  Value: trigger
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement: 
+          - Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Principal: 
+              Service:
+                - lambda.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientReadWriteAccess
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:*
+                  - lambda:*
+                  - logs:*
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - kms:ListAliases
+                  - kms:DescribeKey
+                Resource: '*'
+
+  SourceUpdateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub efs-update
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 180
+      Role: !GetAtt LambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref Subnets
+      FileSystemConfigs:
+        - Arn: !Ref EFSAccessPoint
+          LocalMountPath: /mnt/efs
+      Environment:
+        Variables:
+          SOURCE:  !Sub ${FileSourceBucketIdentifier}-efs-source-${AWS::AccountId}
+                   
+      Layers:
+        - !Ref AWSCliLambdaLayer
+      Code: 
+        ZipFile: |
+          import subprocess
+          import logging
+          import urllib.parse
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          source_bucket = os.environ['SOURCE']
+
+          # This lambda function is to sync the files from S3 bucket to the EFS volume.
+          # Source S3 bucket is supplied as the environmental variable
+
+          def cli_command(command):
+              command_list = command.split(' ')
+              try:
+                  logger.debug("Command: \"{}\"".format(command))
+                  command_result = subprocess.run(command_list, stdout=subprocess.PIPE);
+                  logger.info("Command output:\n---\n{}\n---".format(command_result.stdout.decode('UTF-8')))
+              except Exception as e:
+                  logger.error("Exception: {}".format(e))
+                  return False
+              return True
+
+          def handler(event,context):
+              object_key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              if object_key.startswith('trigger/') and (object_key.endswith('.txt')):
+                  cli_command('/opt/aws --version')
+                  # cli_command('/opt/aws s3 cp --recursive s3://{}/source_dir/ /mnt/efs/'.format(source_bucket))
+                  logger.info('s3 sync completed')
+                  cli_command('ls -la /mnt/efs')
+              else:
+                  logger.info("Not the expected file upload, no actions executed")
+
+  S3LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SourceUpdateFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub arn:aws:s3:::${FileSourceBucketIdentifier}-efs-source-${AWS::AccountId}
+
+Outputs:
+  LogicalID:
+    Description: Lambda Function
+    Value: !Ref SourceUpdateFunction
