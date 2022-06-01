@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cloudformation for deploying an ECS instance that mounts EFS copy files to it
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Networking configuration
+        Parameters:
+          - ExistingAwsVpc
+          - Subnets
+          - SecurityGroupId
+
+      - Label:
+          default: Adapter instance (Fileshare to EFS) config
+        Parameters:
+          - AppIdentifier
+          - Ami
+          - KeyPairName
+          - Hostname
+          - InstanceType
+          - EFSShareFileSystem
+          - NetworkFileshareUsername
+          - NetworkFilesharePassword
+
+
+    ParameterLabels:
+      ExistingAwsVpc:
+        default: VPC where EC2 is deployed
+      Subnets:
+        default: Subnets in the VPC where the EC2 instance is deployed
+
+
+      Ami:
+        default: AMI id for to create EC2 instance
+      KeyPairName:
+        default: SSH key pair to be used for instance
+      Hostname:
+        default: Hostname for the ec2 instance
+      InstanceType:
+        default: Type of instance to be used
+
+      NetworkFileshareUsername: 
+        default: Username to connect to the network fileshare
+      NetworkFilesharePassword:
+        default: SSM Param to get the password to connect to the network fileshare
+      SecurityGroupIds:
+        default: Security Group to be used on the instance
+      EFSShareFileSystem:
+        default: EFS file to be used
+
+
+
+Parameters:
+  ExistingAwsVpc:
+    Description: Name of existing AWS Vpc
+    Type: AWS::EC2::VPC::Id
+    
+  Subnets:
+    Description: Subnets where the service to startup
+    Type: List<AWS::EC2::Subnet::Id>
+    
+  VpcCidr:
+    Description: Cidr range of the vpc
+    Type: String
+    
+
+  InstanceType:
+    Description: Instance Type
+    Type: String
+    Default: t2.micro
+
+  Ami:
+    Description: The AMI to base the instance of
+    Type: AWS::EC2::Image::Id
+    
+  KeyPairName:
+    Description: Public/private key pairs allow you to securely connect to your instance after it launches
+    Type: AWS::EC2::KeyPair::KeyName
+  Hostname:
+    Description: Hostname for the ec2 instance
+    Type: String
+    Default: EFS-Adapter
+
+  NetworkFileshareUsername: 
+    Description: Username to connect to the network fileshare
+    Type: AWS::SSM::Parameter::Value<String>
+    NoEcho: true
+    
+  NetworkFilesharePassword:
+    Description: SSM Param to get the password to connect to the network fileshare
+    Type: AWS::SSM::Parameter::Value<String>
+    
+    NoEcho: true
+  SecurityGroupIds:
+    Description: Existing security groups to assign to the airflow cluster nodes
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    
+  EFSShareFileSystem:
+    Description: ID of EFS  to copy files to
+    Type: String
+    
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-ec2role"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      
+                
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AdministratorAccess
+  
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: Role
+
+  LinuxEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      
+      IamInstanceProfile: !Ref AppInstanceProfile
+      ImageId: !Ref Ami
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      InstanceInitiatedShutdownBehavior: terminate
+      UserData: !Base64
+        Fn::Join:
+          - ''
+          - - "#!/bin/bash -x\n"
+            - "export LC_CTYPE=en_US.UTF-8\n"
+            - "export LC_ALL=en_US.UTF-8\n"
+            - "yum update -y\n"
+            - "yum install -y nfs-utils \n"
+            - "yum install -y cifs-utils \n"
+            - "yum install unzip -y \n"
+
+            - EC2_STACKNAME=
+            - !Ref 'AWS::StackName'
+            - "\n"
+            - EC2_REGION=
+            - !Ref 'AWS::Region'
+            - "\n"
+            - DIR_TGT=/mnt/efs/
+            - "\n"
+            - EFS_FILE_SYSTEM_ID=
+            - !Ref 'EFSShareFileSystem'
+            - "\n"
+            - "mkdir -p $DIR_TGT\n"
+            - "DIR_SRC=$EFS_FILE_SYSTEM_ID.efs.$EC2_REGION.amazonaws.com\n"
+            - mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2
+              $DIR_SRC:/ $DIR_TGT
+            - "\n"
+            - "mkdir -p /mnt/fileshare/external\n"
+            - "chmod ugo+rwx /mnt/fileshare/external\n"
+            - "touch .fileshare-credentials\n"
+            - "chmod 700 .fileshare-credentials\n"
+            - FILESHAREUSERNAME=
+            - !Ref NetworkFileshareUsername
+            - "\n"
+            - FILESHAREPASSWORD='
+            - !Ref NetworkFilesharePassword
+            - "'\n"
+            - "touch .install_awscli\n"
+            - "chmod +x .install_awscli\n"
+            - "echo curl https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip >> .install_awscli \n"
+            - "echo unzip awscliv2.zip >> .install_awscli \n"
+            - "echo ./aws/install >> .install_awscli \n"
+            - "source ./.install_awscli \n"
+            - "echo username=$FILESHAREUSERNAME >> .fileshare-credentials\n"
+            - "echo password=$FILESHAREPASSWORD >> .fileshare-credentials\n"
+            - # Dummy file share mount below
+            - "echo '//fileshare/directory/path    /mnt/fileshare/external      cifs    vers=3.0,credentials=/.fileshare-credentials,iocharset=utf8,file_mode=0777,dir_mode=0777 0 0' >> /etc/fstab\n"
+         
+            - "mount -a > mount-output.txt\n"
+            - "touch .crontab-entry.sh\n"
+            - "chmod +x .crontab-entry.sh\n"
+            - "(crontab -l 2>/dev/null; echo \"*/10 * * * * /.crontab-entry.sh\") | crontab -\n"
+            - "echo rsync -drauv /mnt/fileshare/external/ /mnt/efs/ >> .crontab-entry.sh\n"
+            # - "echo rsync -drauv /mnt/fileshare/external/ /mnt/efs/ >> .crontab-entry.sh && echo /usr/local/bin/aws cloudformation delete-stack --stack-name $EC2_STACKNAME >> .crontab-entry.sh\n"
+            
+
+      SecurityGroupIds: !Ref SecurityGroupIds
+  
+      SubnetId: !Select [ 1, !Ref Subnets ]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+      Tags:
+        - Key: Name
+          Value: !Ref Hostname
+
+
+Outputs:
+  LogicalID:
+    Description: EC2 instance
+    Value: !Ref LinuxEC2
