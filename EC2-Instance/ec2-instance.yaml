@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Cloudformation for deploying an ECS instance that mounts EFS copy files to it
+Description: Cloudformation for deploying an EC2 instance that mounts EFS copy files to it
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
